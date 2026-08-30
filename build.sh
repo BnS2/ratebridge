@@ -3,8 +3,11 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 mkdir -p bin
+# Every file in Sources/, not a named one: a second file that the build does not
+# know about fails at link time with a message about the symbol, not the file.
+# Swift allows top-level code only in main.swift, so the others are declarations.
 swiftc -O -framework CoreAudio -framework Foundation \
-    -o bin/ratebridge Sources/main.swift
+    -o bin/ratebridge Sources/*.swift
 echo "built: $(pwd)/bin/ratebridge"
 
 # Keep the copy in PATH current. It is a copy, not a symlink, so the tool keeps

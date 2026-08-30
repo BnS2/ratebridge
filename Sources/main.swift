@@ -102,6 +102,43 @@ var manualOverrideGrace: TimeInterval {
         ? 300 : settings.double(forKey: "manualOverrideGrace")
 }
 
+/// How long the system output stays muted across a rate write, in seconds.
+/// 0 disables the whole mechanism.
+///
+/// Only ever used on a Mac where the managed device is *not* the system output —
+/// see `SwitchMute` for why that is the only configuration where a rate change
+/// can be heard in the wrong place.
+///
+/// 0.35s was chosen as the smallest value that covers a relock plus the moment a
+/// process tap needs to re-arm behind it. Clamped at 2s because this mutes a
+/// device the user may be listening to, and a bug in the arithmetic must not be
+/// able to turn that into a long silence.
+/// Whether the switch mute runs even when something else is audible on the
+/// system output. On unless someone turns it off, and no longer a question the
+/// window asks.
+///
+/// It shipped as a toggle, defaulting off, on the reasoning that muting a device
+/// somebody may be listening to should be asked for. A day of listening showed
+/// that was the wrong shape for the decision. Off, the guard stands down exactly
+/// when a leak is loudest — measured 2026-08-29, three consecutive switches all
+/// logged "not muting" because Spotify held the speakers, and the leak was
+/// audible on every one. On, the worst case is that whatever plays on those
+/// speakers takes the same ~0.8s gap the DAC is already taking.
+///
+/// Nobody chooses the leak, so it is not a choice. The real question — may
+/// Ratebridge touch the built-in speakers at all — is `mute-during-switch`, and
+/// that one stays in the window. This remains settable from the CLI for the rare
+/// desk where the system output matters more than the DAC.
+var muteOverOthers: Bool {
+    settings.object(forKey: "muteDuringSwitchOverOthers") == nil
+        ? true : settings.bool(forKey: "muteDuringSwitchOverOthers")
+}
+
+var switchMuteGrace: TimeInterval {
+    settings.object(forKey: "muteDuringSwitch") == nil
+        ? 0.35 : min(max(settings.double(forKey: "muteDuringSwitch"), 0), 2)
+}
+
 /// Explicit source ranking, highest first. Empty means "use the rule table
 /// order", which is already ordered deliberately and documented as first-match-
 /// wins. `ratebridge priority` edits this without a rebuild.
@@ -188,6 +225,20 @@ let mediaPlayerBundleIDs: Set<String> = [
     "com.colliderli.iina",
     "com.apple.QuickTimePlayerX",
     "com.coppertino.VoxMac",
+    "app.zen-browser.zen",
+    "org.mozilla.firefox",
+]
+
+/// The browsers among the above, named once.
+///
+/// Used to keep a browser out of `sessionPlayerBundleIDs` however it got a rule.
+/// A browser is open essentially always, so counting one as "a listening session
+/// is in progress" pins the long idle delay on permanently.
+let browserBundleIDs: Set<String> = [
+    "com.apple.Safari",
+    "com.apple.WebKit.GPU",
+    "com.google.Chrome",
+    "com.google.Chrome.helper",
     "app.zen-browser.zen",
     "org.mozilla.firefox",
 ]
@@ -520,6 +571,17 @@ struct Device {
             }
     }
 
+    /// Every output device's name, by id.
+    ///
+    /// The bridge itself only ever needs to know whether a process is on *our*
+    /// device, so nothing kept the other names — which is how both the CLI and
+    /// the Settings window ended up saying "elsewhere". That is the half of the
+    /// answer the reader already had: they know they cannot hear it on the DAC,
+    /// what they want is which device to go and look at.
+    static func namesByID() -> [AudioObjectID: String] {
+        Dictionary(allOutputs().map { ($0.id, $0.name) }, uniquingKeysWith: { first, _ in first })
+    }
+
     /// The device the bridge acts on.
     ///
     /// Defaults to the system output, but can be pinned by name. Pinning matters:
@@ -588,12 +650,38 @@ struct Device {
         return !preferred.isEmpty
     }
 
+    /// The system output's id, cached.
+    ///
+    /// `reaches` asks this for every playing process several times a second now
+    /// that the answer decides an assumption rather than only a warning line.
+    /// It changes when somebody switches output, which is not a thing that
+    /// happens between two ticks of a four-hertz loop.
+    private static var systemOutputCache: (id: AudioObjectID, at: Date) = (0, .distantPast)
+    static func systemOutputID() -> AudioObjectID {
+        let cached = systemOutputCache
+        if Date().timeIntervalSince(cached.at) < targetTTL, cached.id != 0 { return cached.id }
+        let id = getValue(AudioObjectID(kAudioObjectSystemObject),
+                          kAudioHardwarePropertyDefaultOutputDevice,
+                          default: AudioObjectID(0))
+        systemOutputCache = (id, Date())
+        return id
+    }
+
     static func defaultOutput() -> Device? {
         let id = getValue(AudioObjectID(kAudioObjectSystemObject),
                           kAudioHardwarePropertyDefaultOutputDevice,
                           default: AudioObjectID(0))
         guard id != 0 else { return nil }
         return Device(id: id, name: getString(id, kAudioObjectPropertyName) ?? "unknown")
+    }
+
+    /// Whether anything is streaming to this device right now.
+    ///
+    /// The signal the switch mute waits on: a device relocking to a new rate
+    /// drops its stream, and the redirect that feeds it can only come back once
+    /// the device is running again.
+    var isRunningSomewhere: Bool {
+        getValue(id, kAudioDevicePropertyDeviceIsRunningSomewhere, default: UInt32(0)) != 0
     }
 
     var nominalRate: Float64 {
@@ -604,6 +692,46 @@ struct Device {
         getArray(id, kAudioDevicePropertyAvailableNominalSampleRates, AudioValueRange())
             .flatMap { $0.mMinimum == $0.mMaximum ? [$0.mMinimum] : [$0.mMinimum, $0.mMaximum] }
             .sorted()
+    }
+
+    /// The identifier that survives a restart. AudioObjectIDs do not: they are
+    /// handed out per boot, so anything written to disk about a device has to be
+    /// written as a UID or it will name a different device tomorrow.
+    var uid: String? { getString(id, kAudioDevicePropertyDeviceUID) }
+
+    private var muteAddress: AudioObjectPropertyAddress {
+        AudioObjectPropertyAddress(mSelector: kAudioDevicePropertyMute,
+                                   mScope: kAudioDevicePropertyScopeOutput,
+                                   mElement: kAudioObjectPropertyElementMain)
+    }
+
+    /// Whether this device's output is muted, or nil if it has no mute at all.
+    ///
+    /// nil is a real answer and not a failure: plenty of outputs — most USB DACs
+    /// among them — expose no mute control, and the difference between "not
+    /// muted" and "cannot be muted" decides whether anything may be attempted.
+    var isMuted: Bool? {
+        var addr = muteAddress
+        guard AudioObjectHasProperty(id, &addr) else { return nil }
+        var value = UInt32(0)
+        var size = UInt32(MemoryLayout<UInt32>.size)
+        guard AudioObjectGetPropertyData(id, &addr, 0, nil, &size, &value) == noErr
+        else { return nil }
+        return value != 0
+    }
+
+    /// Returns false if the device has no settable mute, in which case nothing
+    /// was changed.
+    @discardableResult
+    func setMuted(_ muted: Bool) -> Bool {
+        var addr = muteAddress
+        var settable: DarwinBoolean = false
+        guard AudioObjectHasProperty(id, &addr),
+              AudioObjectIsPropertySettable(id, &addr, &settable) == noErr, settable.boolValue
+        else { return false }
+        var value: UInt32 = muted ? 1 : 0
+        return AudioObjectSetPropertyData(id, &addr, 0, nil,
+                                          UInt32(MemoryLayout<UInt32>.size), &value) == noErr
     }
 
     /// -1 means no process holds exclusive access.
@@ -644,6 +772,16 @@ struct Device {
         guard AudioObjectIsPropertySettable(id, &addr, &settable) == noErr, settable.boolValue
         else { return "device reports the sample rate is not settable" }
 
+        // Inside the write rather than at its callers. Five places write a rate —
+        // the loop, `set`, `apply`, Match Now, Rest Now — and the leak belongs to
+        // the write itself, so guarding it here is what makes "all of them" true
+        // and keeps it true for the sixth.
+        //
+        // `end()` waits out the grace and unmutes, and runs on every exit from
+        // here including the failure returns below.
+        let mute = SwitchMute.begin(writing: self)
+        defer { mute?.end() }
+
         var value = rate
         let status = AudioObjectSetPropertyData(id, &addr, 0, nil,
                                                 UInt32(MemoryLayout<Float64>.size), &value)
@@ -671,6 +809,190 @@ struct Device {
     }
 }
 
+/// Mutes the system output across a rate write, and puts it back.
+///
+/// The problem is real and it is not ours to fix at the source. On a Mac where
+/// the managed device is not the system output, an app's samples only arrive at
+/// that device because something taps the process and carries them there. Write
+/// a new rate and the device relocks; the tap has to re-arm across that gap, and
+/// while it is not holding, the app is simply audible where it natively renders
+/// — the built-in speakers, at whatever volume they happen to be at. On a
+/// listening desk that is an abrupt, uncontrolled burst out of a transducer
+/// nobody is monitoring, which is a defect and not a cosmetic one.
+///
+/// The tap is private and belongs to another app, so the gap cannot be closed.
+/// What can be done is make it silent.
+///
+/// Deliberately narrow. Every one of these must hold or nothing is touched:
+///
+///   - the managed device is not the system output — otherwise there is nowhere
+///     for the sound to leak *to*, and muting would silence the very device the
+///     write is for;
+///   - an app declared Redirected is playing right now, which is the user
+///     telling us in as many words that the speakers are not where they expect
+///     to hear it. Without that, audio on the system output is audio someone is
+///     listening to, and muting it would be the bug rather than the fix;
+///   - *everything* else that is playing also belongs to the managed device.
+///     This is the case that makes the feature safe to ship: two sources, two
+///     outputs — a redirected album on the DAC and a video on the speakers — is
+///     a perfectly ordinary thing to be doing, and muting the speakers through
+///     the switch would chop a third of a second out of something somebody is
+///     listening to. Trading an audible blip for an audible dropout is not a
+///     fix, so in that configuration nothing is muted and the blip stays;
+///   - the device is not already muted, so nothing we restore can undo a mute
+///     the user set themselves;
+///   - it has a settable mute at all.
+///
+/// The device is recorded in settings *before* it is muted, and cleared after it
+/// is restored, so a session that dies mid-window leaves a note behind rather
+/// than a silent Mac — see `recoverStrandedMute`.
+struct SwitchMute {
+    private let device: Device
+    /// The device being written. The mute ends when this is streaming again,
+    /// not when a timer says so.
+    private let target: Device
+    private let grace: TimeInterval
+
+    static func begin(writing target: Device) -> SwitchMute? {
+        let grace = switchMuteGrace
+        guard grace > 0,
+              let system = Device.defaultOutput(), system.id != target.id,
+              system.isMuted == false,
+              let uid = system.uid
+        else { return nil }
+
+        // Uncached and under a deadline. Uncached because the cached list drops
+        // apps ruled off — and an app you told Ratebridge to ignore is very
+        // often one you are playing somewhere else on purpose, which is exactly
+        // the audio this check exists to protect. Under a deadline like every
+        // other process enumeration on a path that can run from the main thread,
+        // so a wedged coreaudiod cannot freeze a menu click.
+        let live = (withAudioDeadline(1) { uncachedActiveOutputProcesses() }) ?? []
+
+        // Something has to be at risk of leaking: an app that counts as reaching
+        // the device being written while CoreAudio still renders it on the
+        // system output. That is exactly the population a tap carries, and it is
+        // the only population that can come out of the speakers mid-relock.
+        //
+        // This used to ask for `isDeclaredRouted`, which the inclusive model
+        // made vestigial — nobody has to declare anything now, so on a Mac set
+        // up today the mute would simply never have fired.
+        guard live.contains(where: { $0.reaches(target) && $0.deviceIDs.contains(system.id) })
+        else { return nil }
+
+        let others = live.filter { !$0.reaches(target) }
+        if !others.isEmpty {
+            let names = others.map(\.displayName).joined(separator: ", ")
+            let verb = others.count == 1 ? "is" : "are"
+            guard muteOverOthers else {
+                // Said out loud, once per write. Deciding not to act is still a
+                // decision, and this one changes what the user hears.
+                print("[\(stamp())] not muting \(system.name) — \(names) \(verb) playing "
+                    + "there, and `mute-over-others` is off")
+                return nil
+            }
+            print("[\(stamp())] muting \(system.name) across the switch — "
+                + "\(names) \(verb) playing there and will go quiet with it")
+            settings.set(uid, forKey: "switchMuteRecovery")
+            guard system.setMuted(true) else {
+                settings.removeObject(forKey: "switchMuteRecovery")
+                return nil
+            }
+            return SwitchMute(device: system, target: target, grace: grace)
+        }
+
+        settings.set(uid, forKey: "switchMuteRecovery")
+        guard system.setMuted(true) else {
+            settings.removeObject(forKey: "switchMuteRecovery")
+            return nil
+        }
+        // Both halves of the decision are logged now. Only the refusal used to
+        // be, which left the working case indistinguishable from a feature that
+        // never ran — the exact question asked of it: "can you check if it
+        // really mutes".
+        print("[\(stamp())] muting \(system.name) across the switch")
+        return SwitchMute(device: system, target: target, grace: grace)
+    }
+
+    /// Unmute once the redirect has taken the sound back — measured, not timed.
+    ///
+    /// It used to sleep for the grace and unmute. Measured on this Mac
+    /// 2026-08-29, across a 48 → 96 kHz write: the DAC drops its stream for
+    /// ~0.68s while it relocks, and the mute lasted 0.40s. So the speakers came
+    /// back 0.3s before the redirect did, and the app that was mid-relock played
+    /// those 0.3s out of the built-in speakers — the exact leak this guard
+    /// exists to hide, produced by the guard's own timer.
+    ///
+    /// A fixed grace cannot be right: the downtime is the device's, it varies
+    /// with the rate written, and the only honest end condition is "the target
+    /// is streaming again". The configured grace becomes the *minimum* — short
+    /// switches behave exactly as before — and a cap keeps a device that never
+    /// comes back from holding the speakers silent for ever.
+    func end() {
+        let floor = Date().addingTimeInterval(grace)
+        let cap = Date().addingTimeInterval(grace + 1.5)
+        var back = false
+        while Date() < cap {
+            if Date() >= floor, target.isRunningSomewhere { back = true; break }
+            usleep(20_000)
+        }
+        // A short tail after the stream returns: the device reports running the
+        // moment IO restarts, and the first buffers are still in flight.
+        if back { usleep(60_000) }
+        device.setMuted(false)
+        settings.removeObject(forKey: "switchMuteRecovery")
+        print("[\(stamp())] \(device.name) audible again — "
+            + (back ? "\(target.name) is streaming" : "gave up waiting for \(target.name)"))
+    }
+}
+
+/// What the switch mute will do on the next write, or nil when it does not
+/// apply to this Mac at all.
+///
+/// Written because the guard's most important decision is the one where it does
+/// *nothing*: audio on the system output means someone may be listening to it,
+/// so the mute is skipped and the blip stays. That is correct and it is silent,
+/// which from outside is indistinguishable from a feature that does not work.
+func switchMuteStatus(_ device: Device) -> String? {
+    guard switchMuteGrace > 0,
+          let system = Device.defaultOutput(), system.id != device.id else { return nil }
+    let live = uncachedActiveOutputProcesses()
+    guard live.contains(where: { $0.reaches(device) && $0.deviceIDs.contains(system.id) })
+    else { return nil }
+
+    let others = live.filter { !$0.reaches(device) }
+    guard !others.isEmpty else {
+        return "armed — \"\(system.name)\" goes quiet across a rate change, until "
+             + "\"\(device.name)\" is streaming again"
+    }
+    let names = others.map(\.displayName).joined(separator: ", ")
+    let verb = others.count == 1 ? "is" : "are"
+    return muteOverOthers
+        ? "armed — \"\(system.name)\" goes quiet across a rate change, and \(names) "
+          + "\(verb) playing there, so \(others.count == 1 ? "it" : "they") will go quiet too"
+        : "suppressed — \(names) \(verb) playing on \"\(system.name)\", so it is left "
+          + "alone and the switch stays audible there  [`mute-over-others` is off]"
+}
+
+/// Undo a mute left behind by a session that was killed mid-switch.
+///
+/// `end()` is deferred and so survives an error return or a thrown signal, but
+/// nothing survives SIGKILL — and "my Mac has no sound and I do not know why" is
+/// the worst thing this feature could leave behind. So the marker is written
+/// before the mute and cleared after it, and any run that finds one puts the
+/// device back before doing anything else.
+func recoverStrandedMute() {
+    guard let uid = settings.string(forKey: "switchMuteRecovery"), !uid.isEmpty else { return }
+    settings.removeObject(forKey: "switchMuteRecovery")
+    guard let stranded = (withAudioDeadline(2) {
+        Device.allOutputs().first { $0.uid == uid }
+    }) ?? nil else { return }
+    if stranded.setMuted(false) {
+        print("[\(stamp())] unmuted \(stranded.name) — a previous run was "
+            + "interrupted while switching")
+    }
+}
+
 /// The rate ratebridge itself last wrote, and to which device.
 ///
 /// Stored in settings rather than in memory because the writer and the observer
@@ -694,6 +1016,52 @@ func ourLastWrite() -> (device: AudioObjectID, rate: Float64)? {
     return (AudioObjectID(settings.integer(forKey: "lastWrittenDevice")), rate)
 }
 
+/// Why a process counts, or does not, for the device ratebridge manages.
+enum ReachVerdict: String {
+    /// CoreAudio reports it rendering on that device. Measured, and it wins.
+    case onTarget
+    /// The user marked it "Excluded" — `rule <id> off`.
+    case excluded
+    /// The user declared it as routed there — `routed add <id>`.
+    case declared
+    /// Not measurable either way, and assumed to arrive. See `reachVerdict`.
+    case assumed
+    /// Measurably somewhere else.
+    case elsewhere
+
+    var counts: Bool {
+        switch self {
+        case .onTarget, .declared, .assumed: return true
+        case .excluded, .elsewhere:          return false
+        }
+    }
+}
+
+/// The precedence, with nothing to look up.
+///
+/// Every input is a parameter, so this can be tested without a device, a
+/// settings store or a running coreaudiod — which matters, because the order is
+/// the part that has been wrong twice. `routed` ahead of `off` left an excluded
+/// app counted; assuming without checking where the process renders would have
+/// swallowed an app that is measurably on a third device.
+///
+/// - Parameter usesTarget: CoreAudio reports the process on the managed device.
+/// - Parameter targetIsSystemOutput: when true, CoreAudio's report is the whole
+///   answer — an app it puts elsewhere is elsewhere, and no guess is wanted.
+/// - Parameter rendersOnSystemOutput: where the target is *not* the system
+///   output, this is the population a per-app tap carries: the app renders to
+///   the system output and something else moves its sound. Both a redirected app
+///   and a plain one look exactly like this, which is why the answer is a guess
+///   and why it is confined to them.
+func reachVerdict(usesTarget: Bool, ruledOff: Bool, declared: Bool,
+                  targetIsSystemOutput: Bool, rendersOnSystemOutput: Bool) -> ReachVerdict {
+    if usesTarget { return .onTarget }
+    if ruledOff { return .excluded }
+    if declared { return .declared }
+    if targetIsSystemOutput { return .elsewhere }
+    return rendersOnSystemOutput ? .assumed : .elsewhere
+}
+
 // MARK: - Active audio processes
 
 struct AudioProcess {
@@ -712,28 +1080,109 @@ struct AudioProcess {
     /// actively redirected to the built-in speakers still reported the DAC.
     func uses(_ device: Device) -> Bool { deviceIDs.contains(device.id) }
 
-    /// Whether this process's audio actually comes out of the device we target.
+    /// Whether this process's audio counts as coming out of the device we target.
     ///
     /// A player on a different output cannot conflict with ours, so it must not
     /// block a switch — the guard is about churn on one device, not about any
-    /// audio existing anywhere. But `uses` alone answers the wrong question on a
-    /// Mac with per-app routing, and in both directions:
+    /// audio existing anywhere. `uses` answers that on an ordinary Mac and
+    /// cannot answer it at all on a Mac with per-app routing: a tap is private
+    /// by design — `kAudioHardwarePropertyTapList` returned zero taps while a
+    /// redirect was running — so CoreAudio reports every redirected app on the
+    /// system output, whichever device the sound actually leaves by.
     ///
-    ///   - Routed *away* from the target: CoreAudio still reports it here, so the
-    ///     bridge follows a rate for audio that is coming out of another device.
-    ///     `ratebridge rule <id> off` is the existing cure.
-    ///   - Routed *to* the target: CoreAudio reports it on the system default, so
-    ///     the bridge filters it out and rests at the idle rate while the DAC is
-    ///     playing a 96 kHz track. Nothing covered this until `routed`.
+    /// So when the target *is* the system output, this is measured. When it is
+    /// not, nothing about routing is measurable and the question becomes which
+    /// way to be wrong. It assumes the app reaches the target and lets the user
+    /// say otherwise, because that is the Mac the user described: they pinned a
+    /// device that is not the system output, which means something feeds it, and
+    /// the apps they route are the apps they are listening to. The exception is
+    /// the mark they make — `rule <id> off`, "Excluded" in the window — and it
+    /// is one mark per app that plays somewhere else, not one per app they route.
     ///
-    /// A tap is private by design — `kAudioHardwarePropertyTapList` returned zero
-    /// taps while a redirect was running — so this can only ever be declared, not
-    /// detected. `routed` is that declaration, and it is deliberately about the
-    /// *state* an app is in, not about whichever tool put it there.
-    func reaches(_ device: Device) -> Bool { uses(device) || isDeclaredRouted(self) }
+    /// The order matters, and one order is wrong. Measurement first: an app
+    /// CoreAudio puts on this device is on it, whatever anyone has declared.
+    /// Then the exclusion, ahead of `routed` — Zen and Musicer are both declared
+    /// on this Mac, and with `routed` tested first, excluding one of them left
+    /// it counted anyway: still a rate source's rival, and still able to make
+    /// the switch mute fire while its sound was coming out of the speakers. A
+    /// mark the user makes has to beat a declaration they made earlier.
+    func reaches(_ device: Device) -> Bool { verdict(for: device).counts }
+
+    /// Why this process does or does not count, rather than only whether it
+    /// does. `probe` used to re-derive this from the same three predicates in a
+    /// different order and could disagree with `reaches` — it called a declared
+    /// app "counted (declared)" while the engine, correctly, was not counting it
+    /// because the user had excluded it. One answer now, asked once.
+    func verdict(for device: Device) -> ReachVerdict {
+        let system = Device.systemOutputID()
+        return reachVerdict(usesTarget: uses(device),
+                            ruledOff: isRuledOff(self),
+                            declared: isDeclaredRouted(self),
+                            targetIsSystemOutput: system == device.id,
+                            rendersOnSystemOutput: deviceIDs.contains(system))
+    }
 
     /// Bundle id when there is one, else the executable name.
+    ///
+    /// The identifier, for the CLI and the log: `probe` and `status` exist to be
+    /// precise, and `com.google.Chrome.helper` says something `Google Chrome`
+    /// does not. Anything a person reads casually wants `displayName` instead.
     var label: String { bundleID ?? name }
+
+    /// What a person calls this app — "Musicer", not "com.wangchujiang.musicer".
+    ///
+    /// The menu bar showed the bundle id for a year because the same string fed
+    /// the log, where it belongs. They are different audiences and the identifier
+    /// is only right for one of them.
+    var displayName: String { appDisplayName(bundleID: bundleID, fallback: name) }
+}
+
+/// Bundle id to the name shown in the Finder, cached.
+///
+/// Resolved from the running app, so it needs no lookup table and picks up the
+/// user's own localisation. Falls back to the identifier's last component and
+/// then to the executable name, so a bundle-less process still reads as
+/// something rather than blank.
+var appDisplayNameCache: [String: String] = [:]
+
+func appDisplayName(bundleID: String?, fallback: String) -> String {
+    guard let bundleID else { return fallback }
+    if let cached = appDisplayNameCache[bundleID] { return cached }
+    // Cache only a real answer. Caching a fallback would pin it for the life of
+    // the process, and the first lookup easily lands while the app is still
+    // launching and NSRunningApplication has nothing to say about it.
+    if let name = NSRunningApplication
+        .runningApplications(withBundleIdentifier: bundleID)
+        .compactMap(\.localizedName).first {
+        appDisplayNameCache[bundleID] = name
+        return name
+    }
+    // Installed but not running. Without this the name fell back to the last
+    // component of the identifier, which gives "musicer" for Musicer and — worse
+    // — "client" for com.spotify.client.
+    if let url = appBundleURL(bundleID) {
+        let name = FileManager.default.displayName(atPath: url.path)
+        appDisplayNameCache[bundleID] = name
+        return name
+    }
+    return bundleID.split(separator: ".").last.map(String.init) ?? fallback
+}
+
+/// Where an app with this identifier is installed, if it is. Also the test for
+/// whether it is worth showing in a list at all.
+///
+/// Helper processes answer nil, which is the point: `com.apple.WebKit.GPU` is a
+/// rule the bridge needs and not an app anyone should be offered a setting for.
+/// It also resolved, through the running-application lookup, to whichever
+/// WebKit-hosting app happened to own the helper — a settings row reading
+/// "Google Drive Graphics and Media" for Safari's GPU process.
+var appBundleURLCache: [String: URL?] = [:]
+
+func appBundleURL(_ bundleID: String) -> URL? {
+    if let cached = appBundleURLCache[bundleID] { return cached }
+    let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleID)
+    appBundleURLCache[bundleID] = url
+    return url
 }
 
 /// Executable name for a pid. Bundle-less processes still hold output streams
@@ -830,8 +1279,8 @@ func invalidateActiveProcesses() {
 /// ever — silently, since nothing was playing on it. `off` now means invisible,
 /// which is the only reading that matches what the user is declaring.
 func isRuledOff(_ process: AudioProcess) -> Bool {
-    guard let bundleID = process.bundleID,
-          let matched = ruleTable.first(where: { $0.bundleID == bundleID }) else { return false }
+    guard let matched = ruleTable.first(where: { $0.bundleID == process.label })
+    else { return false }
     if case .off = matched.policy { return true }
     return false
 }
@@ -964,8 +1413,7 @@ func resolveTargetRate(on device: Device? = nil) -> Resolution {
 
     let table = ruleTable
     func rule(for process: AudioProcess) -> (bundleID: String, policy: Policy)? {
-        guard let bundleID = process.bundleID else { return nil }
-        return table.first { $0.bundleID == bundleID }
+        table.first { $0.bundleID == process.label }
     }
 
     // A player that is demonstrably paused has not torn down its IO context yet.
@@ -1097,15 +1545,20 @@ func apply(_ target: Float64, to device: Device, because reason: String) -> Neve
 /// nothing, for ever, without a word about why.
 func targetIsNotSystemOutput(_ device: Device) -> String? {
     guard let system = Device.defaultOutput(), system.id != device.id else { return nil }
-    return "system output is \"\(system.name)\" — audio reaches "
-         + "\"\(device.name)\" only if something routes it there. "
-         + "If a per-app router does, declare it: `ratebridge routed add <id>`. "
-         + "Otherwise `ratebridge device default` follows the system output."
+    return "system output is \"\(system.name)\", so macOS cannot say which apps reach "
+         + "\"\(device.name)\". Anything playing is assumed to; exclude the ones that "
+         + "do not with `ratebridge rule <id> off`. "
+         + "Or `ratebridge device default` to follow the system output instead."
 }
 
 func commandStatus(_ device: Device) -> Never {
+    // `status` is what someone runs when the Mac is doing something they cannot
+    // explain, and a mute left behind by a killed session is exactly that. It
+    // costs one settings read when there is nothing to undo.
+    recoverStrandedMute()
     print("device        \(device.name)  [\(Device.targetReason)]")
     if let mismatch = targetIsNotSystemOutput(device) { print("⚠ output       \(mismatch)") }
+    if let mute = switchMuteStatus(device) { print("switch mute   \(mute)") }
     print("current rate  \(formatRate(device.nominalRate))")
     print("supported     \(device.availableRates.map(formatRate).joined(separator: ", "))")
 
@@ -1113,17 +1566,25 @@ func commandStatus(_ device: Device) -> Never {
     print("hog mode      \(owner == -1 ? "free" : "held by pid \(owner)")")
 
     let active = activeOutputProcesses()
-    if active.isEmpty {
+    // Excluded apps are dropped from `active` before anything sees them, so
+    // saying nothing here leaves the reader comparing what they can hear against
+    // a list that silently omits it — the same failure `probe` fixed, and now
+    // more likely, since excluding is the one mark this model asks people to
+    // make.
+    let excluded = uncachedActiveOutputProcesses().filter(isRuledOff)
+        .map { "\($0.label) (pid \($0.pid)) [excluded]" }
+    if active.isEmpty && excluded.isEmpty {
         print("playing       nothing")
+    } else if active.isEmpty {
+        print("playing       " + excluded.joined(separator: ", "))
     } else {
         // Say which of them actually reach this device. Everything else on the
         // list is audible somewhere, just not somewhere this bridge can act on,
         // and the two used to be printed identically.
         print("playing       " + active.map { process -> String in
-            let where_ = process.uses(device) ? ""
-                : isDeclaredRouted(process) ? " [routed here]" : " [elsewhere]"
+            let where_ = process.reaches(device) ? "" : " [not on \(device.name)]"
             return "\(process.label) (pid \(process.pid))\(where_)"
-        }.joined(separator: ", "))
+        }.joined(separator: ", ") + (excluded.isEmpty ? "" : ", " + excluded.joined(separator: ", ")))
     }
     print("daemon        \(daemonIsRunning() ? "ON" : "off")")
     let ignored = excludedBundleIDs.sorted() + excludedProcessNames.sorted()
@@ -1382,7 +1843,31 @@ func openFileRate(pid: pid_t, label: String, fallback: Float64? = nil,
         // filenames. When it is not showing anything usable there is still no
         // answer, and no answer is better than a guess: a rate written from the
         // wrong file lands in a live stream and relocks the DAC for nothing.
-        guard let playing = identifyPlayingFile(rates.map(\.0), showing: texts),
+        //
+        // Prime the reader when the caller had nothing to show us. Only the `ui`
+        // branch ever passed `showing:` — `fileBased` and the generic tier both
+        // arrived here with an empty list, so `identifyPlayingFile` was handed
+        // nothing to match and returned nil every time. That is the whole of "it
+        // follows Musicer and nothing else" on a Mac with a different gapless
+        // player: not a reader that cannot read them, a reader that was never
+        // asked. `ratebridge files <pid>` has always primed it the same way and
+        // has always given the right verdict, so the daemon was disagreeing with
+        // its own diagnostic — which is what kept this invisible.
+        //
+        // Lazy on purpose. This branch runs only on ambiguity; `readNative` holds
+        // its own 2-4s scan cooldown and `openAudioFiles` is cached 2s, so the
+        // cost is bounded well below the per-poll AX walk that was measured as
+        // audible ticking in the player's own main thread.
+        //
+        // Known limit: the scan cooldown is global, not per-pid, so with two
+        // ambiguous players live at once one of them can be refused a scan and go
+        // unidentified for a poll or two. It fails to nil, never to a guess.
+        var showing = texts
+        if showing.isEmpty {
+            _ = PlayerUIReader.readNative(pid: pid)
+            showing = PlayerUIReader.visibleTexts(pid: pid)
+        }
+        guard let playing = identifyPlayingFile(rates.map(\.0), showing: showing),
               let rate = rates.first(where: { $0.0 == playing })?.1
         else { return nil }
         return (rate, "\(label) — \((playing as NSString).lastPathComponent)"
@@ -2090,7 +2575,7 @@ var silentSince: Date?
 /// open essentially always, so counting it here would leave the long idle delay in
 /// permanent effect and the short one would never run. A *music player* sitting
 /// open and paused is the case this exists for.
-let sessionPlayerBundleIDs: Set<String> = [
+let builtinSessionPlayerBundleIDs: Set<String> = [
     "com.wangchujiang.musicer",
     "org.videolan.vlc",
     "com.spotify.client",
@@ -2098,6 +2583,30 @@ let sessionPlayerBundleIDs: Set<String> = [
     "com.colliderli.iina",
     "com.coppertino.VoxMac",
 ]
+
+/// The built-ins, plus every player the user has added a rule for.
+///
+/// This set was a compile-time constant, and that quietly undid half of "adding a
+/// player costs a command, not a code change": `ratebridge rule <id> file` made a
+/// new player followable, but it was still not a *player* here, so pausing it got
+/// the 30s idle delay instead of the 120s one and the DAC dropped to the resting
+/// rate between tracks. The rule table is the user saying "this is a player I
+/// care about", so take them at their word rather than asking for a second
+/// declaration.
+///
+/// Browsers are excluded by name, not by policy: a browser is open essentially
+/// always, and counting one here would leave the long delay permanently in effect
+/// and the short one unreachable — the exact failure the comment above describes.
+var sessionPlayerBundleIDs: Set<String> {
+    let overrides = (settings.dictionary(forKey: "rules") as? [String: String]) ?? [:]
+    let added = overrides.compactMap { bundleID, raw -> String? in
+        guard let policy = Policy.parse(raw) else { return nil }
+        if case .off = policy { return nil }
+        guard !browserBundleIDs.contains(bundleID) else { return nil }
+        return bundleID
+    }
+    return builtinSessionPlayerBundleIDs.union(added)
+}
 
 /// Whether a music player is still open, even if it holds no output stream right
 /// now. A paused Musicer is a session in progress; nothing open is a session that
@@ -2285,6 +2794,16 @@ var bridgeDeviceName = "—"
 var bridgeElsewhere: String?
 var bridgeCurrentRate: Float64 = 0
 var bridgeSourceLabel = "nothing"
+/// The one source the device is currently following, as a bundle id, or nil when
+/// nothing is being followed.
+///
+/// `bridgeSourceLabel` is every app holding an output stream, which is a
+/// different question and the one that cannot answer "why is my DAC at 44.1?".
+/// Published because with two players live the answer is a ranking decision, and
+/// a ranking decision nobody can see is indistinguishable from a random one.
+var bridgeWinner: String?
+/// `bridgeSourceLabel` in display names rather than bundle ids, for the menu.
+var bridgeSourceNames = ""
 var bridgeLastAction = ""
 /// Whether the UI reader can actually see the player. Under launchd or without an
 /// Accessibility grant it returns nil, which is indistinguishable from "nothing to
@@ -2292,6 +2811,19 @@ var bridgeLastAction = ""
 var bridgeReaderStatus = "checking…"
 /// Set when the bridge is deliberately declining to switch, with the reason.
 var bridgeHolding: String?
+
+/// Set only when something is actually wrong and you can do something about it:
+/// coreaudiod not answering, or a pinned device that is not plugged in.
+///
+/// Split out of `bridgeHolding` because the menu bar wore a warning triangle for
+/// both, and the two are not the same news. "Musicer has no readable rate" is
+/// the bridge working — it declines to guess a rate into a live stream, which is
+/// the whole point of it — and it is the most common state on a Mac whose player
+/// has its window closed. A triangle for that means the icon is a warning most
+/// of the day, which trains you to ignore it and, worse, makes a correct program
+/// look broken. Reported 2026-08-29 as exactly that: "it feels that there is
+/// issue with the app".
+var bridgeFault: String?
 
 /// When the bridge loop last got a reading out of Musicer. Published so reader
 /// health can be reported without a second thread doing its own AX reads —
@@ -2440,6 +2972,7 @@ func runBridgeLoop(mode: DaemonMode) {
         bridgeDeviceName = "no audio"
         bridgeCurrentRate = 0
         bridgeHolding = "CoreAudio is not responding"
+        bridgeFault = bridgeHolding
         note("CoreAudio is not responding — waiting for coreaudiod. Every audio "
            + "client on this Mac is blocked, not just ratebridge. Usually a USB "
            + "DAC that vanished during a rate change: re-plug it, or "
@@ -2449,7 +2982,12 @@ func runBridgeLoop(mode: DaemonMode) {
     if waited {
         note("CoreAudio is answering again — resuming")
         bridgeHolding = nil
+        bridgeFault = nil
     }
+
+    // Before anything else that makes a sound: if the last run was killed while
+    // it had the system output muted, give it back.
+    recoverStrandedMute()
 
     let hotplug = DeviceHotplugWatcher()
     hotplug.start()
@@ -2588,6 +3126,7 @@ func runBridgeLoop(mode: DaemonMode) {
             bridgeDeviceName = "no device"
             bridgeCurrentRate = 0
             bridgeHolding = "CoreAudio is not responding"
+            bridgeFault = bridgeHolding
             note("CoreAudio is not responding — coreaudiod did not answer in 8s. "
                + "Usually a USB DAC that vanished during a rate change; "
                + "re-plug it, or `sudo killall coreaudiod`.")
@@ -2605,9 +3144,14 @@ func runBridgeLoop(mode: DaemonMode) {
             bridgeCurrentRate = 0
             bridgeHolding = Device.targetReason.contains("not connected")
                 ? Device.targetReason : "no output device"
+            bridgeFault = bridgeHolding
             note("waiting — \(bridgeHolding ?? "no output device")")
             bridgeSleep(mode == .follow ? 0.25 : pollInterval); continue
         }
+
+        // Past both guards: coreaudiod answered and the device is here. Anything
+        // the loop declines to do below this line is restraint, not a fault.
+        bridgeFault = nil
 
         let profiling = ProcessInfo.processInfo.environment["RATEBRIDGE_PROFILE"] != nil
         let t0 = Date()
@@ -2618,10 +3162,19 @@ func runBridgeLoop(mode: DaemonMode) {
         let t2 = Date()
         bridgeSourceLabel = activeNow.isEmpty
             ? "nothing" : activeNow.map(\.label).joined(separator: ", ")
+        // The same thing in the words a person uses. Two variables rather than
+        // one formatter because the log line and the menu line are written at
+        // different moments and must not drift apart.
+        bridgeSourceNames = activeNow.isEmpty
+            ? "" : activeNow.map(\.displayName).joined(separator: ", ")
+        // Everything playing is excluded or measurably on another device, so the
+        // device is resting while the Mac is making noise. Worth saying: from
+        // outside, a resting bridge and a broken one look identical.
         bridgeElsewhere = activeNow.isEmpty || activeNow.contains(where: { $0.reaches(device) })
             ? nil
-            : "\(bridgeSourceLabel) renders to "
-              + "\(Device.defaultOutput()?.name ?? "another device"), not \(device.name)"
+            : "nothing playing counts for \(device.name) — "
+              + "\(bridgeSourceNames.isEmpty ? bridgeSourceLabel : bridgeSourceNames) "
+              + "\(activeNow.count == 1 ? "is" : "are") excluded or on another device"
 
         if forceReevaluate {
             forceReevaluate = false
@@ -2630,10 +3183,16 @@ func runBridgeLoop(mode: DaemonMode) {
         }
 
         // Wall-clock silence, so the two poll cadences cannot mean two delays.
-        if activeNow.isEmpty {
-            if silentSince == nil { silentSince = Date() }
-        } else {
+        //
+        // Silence means nothing *counted* is live, not that no process holds a
+        // stream anywhere. With every playing app excluded or on another device
+        // this device has nothing to follow and is exactly as idle as a quiet
+        // Mac — and it was the disagreement between those two readings that let
+        // the resting write skip its delay entirely, below.
+        if activeNow.contains(where: { $0.reaches(device) }) {
             silentSince = nil
+        } else if silentSince == nil {
+            silentSince = Date()
         }
 
         guard bridgeEnabled else {
@@ -2674,9 +3233,14 @@ func runBridgeLoop(mode: DaemonMode) {
             let active = activeOutputProcesses().filter { $0.reaches(device) }
             let table = ruleTable
 
+            // Keyed on `label` — the bundle id when there is one, the executable
+            // name when there is not. Matching on `bundleID` alone meant a
+            // process without one could never carry a rule: `afplay`, a helper,
+            // a game's audio process. Harmless while nothing counted until it
+            // was declared; not harmless now that everything playing counts,
+            // because it made those processes followable and un-excludable.
             func rule(for process: AudioProcess) -> (bundleID: String, policy: Policy)? {
-                guard let bundleID = process.bundleID else { return nil }
-                return table.first { $0.bundleID == bundleID }
+                table.first { $0.bundleID == process.label }
             }
 
             // A player that is demonstrably paused is neither a source nor a
@@ -2722,10 +3286,37 @@ func runBridgeLoop(mode: DaemonMode) {
             // Do not hand the device to a lower-ranked source while the one we
             // were following is still holding an output stream and only just
             // stopped answering. That is a gap between tracks, not a handover.
+            //
+            // Two ways to still be holding it, and the second is the important
+            // one:
+            //
+            //   - within `lowerRankHoldOff` of the last reading. Covers the
+            //     ordinary gap between tracks, where the player answers again a
+            //     moment later.
+            //   - paused, with its output stream still open. Observed on a real
+            //     desk: pause Musicer and eight seconds later the browser — which
+            //     has held a silent stream open all along — inherited the DAC on
+            //     an *assumed* 48 kHz and relocked it from 96. Press play and it
+            //     went back. Every pause cost a relock, and on a Mac where the
+            //     DAC is fed by a per-app router each relock is audible through
+            //     the speakers while the tap re-arms.
+            //
+            //     A paused player has not finished; it is a session in progress
+            //     with the lights still on. So it keeps the device until it tears
+            //     the stream down or everything goes idle, rather than for a
+            //     fixed eight seconds.
+            //
+            // Note what this does *not* do: it does not rank measurement above
+            // assumption in general, which is the mistake that once made every
+            // constant-rate source unfollowable. A browser alone still gets the
+            // device and still sets 48. This only stops a guess from taking the
+            // device off a rate a measurement put there, while the source of that
+            // measurement is sitting right there, paused.
             let candidates: [AudioProcess]
             if let previous = lastWinner,
-               Date().timeIntervalSince(previous.at) < lowerRankHoldOff,
-               active.contains(where: { $0.bundleID == previous.bundleID }) {
+               let holder = active.first(where: { $0.bundleID == previous.bundleID }),
+               Date().timeIntervalSince(previous.at) < lowerRankHoldOff
+                || PlayerState.of(holder.bundleID) == .paused {
                 candidates = sources.filter {
                     sourceRank($0.bundleID ?? "", table: table) <= previous.rank
                 }
@@ -2749,6 +3340,7 @@ func runBridgeLoop(mode: DaemonMode) {
                 if let matched, case .uiReader = matched.policy { lastReaderSuccess = Date() }
                 let id = matched?.bundleID ?? winner.label
                 lastWinner = (id, sourceRank(id, table: table), Date())
+                bridgeWinner = winner.bundleID ?? winner.label
                 // Everything else that is live when we write. Reported at the
                 // write, because "we chose Musicer over the tab" is the one thing
                 // that makes an unexpected relock explainable after the fact.
@@ -2799,10 +3391,9 @@ func runBridgeLoop(mode: DaemonMode) {
                 if let elsewhere = bridgeElsewhere {
                     why += "  (\(elsewhere))"
                     if lastReported != "elsewhere" {
-                        note("elsewhere — \(elsewhere). If a per-app router sends "
-                           + "it here anyway, declare it: `ratebridge routed add "
-                           + "<id>`. Otherwise `ratebridge device default` follows "
-                           + "the system output.")
+                        note("\(elsewhere). If one of them does reach "
+                           + "\(device.name) after all, take it off the excluded "
+                           + "list: `ratebridge rule <id> default`.")
                         lastReported = "elsewhere"
                     }
                 }
@@ -2877,6 +3468,10 @@ func runBridgeLoop(mode: DaemonMode) {
         }
 
         guard let target = desired else {
+            // Nothing is being followed — idle, holding, or no source could
+            // state a rate. Whatever the badge said a moment ago is no longer
+            // true, and a stale "setting the rate" is worse than none.
+            bridgeWinner = nil
             stablePolls = 0
             bridgeSleep(mode == .follow ? 0.25 : pollInterval); continue
         }
@@ -2925,7 +3520,16 @@ func runBridgeLoop(mode: DaemonMode) {
         // short settle is enough — just long enough to skip the transient while a
         // track is being swapped in. The switch then lands in the first moment of
         // the new track rather than mid-song.
-        let goingToRest = activeNow.isEmpty
+        //
+        // Keyed on what is being written, not on who is holding a stream. It was
+        // `activeNow.isEmpty`, which is a narrower thing than "we are resting":
+        // when apps were playing but none of them counted, the idle branch chose
+        // the resting rate and this gate then let it through with no delay at
+        // all. Observed 2026-08-30 — excluding the one counted app dropped the
+        // DAC from 44.1 to 48 kHz about six seconds later, against a configured
+        // wait of 120. The configured wait now means the same thing whichever
+        // way the device fell idle.
+        let goingToRest = idleTarget
         // 2 polls at 0.25s = 0.5s settle, and a track change bypasses it entirely.
         let needed = mode == .follow ? 2 : requiredStablePolls
 
@@ -3135,8 +3739,36 @@ func commandOff() -> Never {
 /// Automation grants are per-executable, and macOS will not reliably hold a grant
 /// for a bare CLI binary launched by launchd. Bundling is what makes the UI reader
 /// work unattended.
+/// A single line drawn across the whole status item, for the off state.
+///
+/// `.strikethroughStyle` on the attributed title does nothing here: the status
+/// item's button re-renders the title with its own styling and drops the
+/// attribute, which is invisible until you magnify a screenshot of the bar and
+/// find the line was never there. Drawing it is the only way that holds.
+///
+/// One stroke across both lines rather than a strike per line, because the claim
+/// is about the reading as a whole and not about either half of it.
+final class SlashOverlay: NSView {
+    /// Matched to the muted title, so the two read as one switched-off thing
+    /// rather than a bright line over faded text.
+    var stroke: NSColor = .labelColor
+
+    override func draw(_ dirtyRect: NSRect) {
+        stroke.setStroke()
+        let path = NSBezierPath()
+        path.lineWidth = 1.5
+        path.lineCapStyle = .round
+        // The frame is the text, not the button, so the line only needs to clear
+        // the glyphs by a little at each end.
+        path.move(to: NSPoint(x: bounds.minX, y: bounds.minY + 2))
+        path.line(to: NSPoint(x: bounds.maxX, y: bounds.maxY - 2))
+        path.stroke()
+    }
+}
+
 final class MenuBarController: NSObject, NSApplicationDelegate {
     private var statusItem: NSStatusItem!
+    private let slash = SlashOverlay()
     private var refresh: Timer?
     private let mode: DaemonMode
 
@@ -3149,13 +3781,15 @@ final class MenuBarController: NSObject, NSApplicationDelegate {
         freopen(logPath, "a", stderr)
         setbuf(stdout, nil)
 
-        // Prompt properly when untrusted. This registers the app with TCC and opens
-        // the right pane, which is far more reliable than adding it by hand — and a
-        // rebuild changes the ad-hoc signature, so this happens more than once.
-        if !AXIsProcessTrusted() {
-            let key = kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String
-            _ = AXIsProcessTrustedWithOptions([key: true] as CFDictionary)
-        }
+        // Tooltips, sooner. AppKit reads its initial tooltip delay from this
+        // default in milliseconds, and the system value is long enough that a
+        // help mark you deliberately hovered feels broken before it answers.
+        //
+        // Registered, not written: the registration domain is this process only,
+        // so it cannot leak into `-g` and change the delay for every other app
+        // on the Mac. 250 ms is short enough to feel like a reply and long
+        // enough that dragging the pointer across a row does not set one off.
+        UserDefaults.standard.register(defaults: ["NSInitialToolTipDelay": 250])
 
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         statusItem.button?.title = "♪ —"
@@ -3166,24 +3800,51 @@ final class MenuBarController: NSObject, NSApplicationDelegate {
             self?.rebuild()
         }
         rebuild()
+
+        // The bare TCC prompt used to fire here. On its own it says only that
+        // Ratebridge wants to control the computer — not what for, and not that
+        // there are two more steps behind it. The window says all three, and its
+        // own button raises the same prompt, so this is one path instead of two
+        // competing ones. Shown after the status item exists, so dismissing it
+        // leaves the user somewhere rather than nowhere.
+        SetupWindowController.showIfNeeded()
     }
 
     private func rebuild() {
         let rate = bridgeCurrentRate > 0 ? formatRate(bridgeCurrentRate) : "—"
-        // ⚠ means "deliberately not switching", which is very different from idle.
-        let mark = bridgeHolding != nil || bridgeElsewhere != nil ? " ⚠" : ""
-        statusItem.button?.title = bridgeEnabled ? "♪ \(rate)\(mark)" : "♪ ⏸"
+        setStatusTitle()
 
+        // Three audiences used to share one menu: the state, the controls, and a
+        // developer's diagnostic readout, fifteen items deep with bundle ids in
+        // it. Only the first two belong in front of someone who just wants their
+        // DAC to work. The rest moved to Details, which is one click away and
+        // loses nothing.
         let menu = NSMenu()
-        menu.addItem(info("\(bridgeDeviceName) — \(rate)   [\(Device.targetReason)]"))
-        menu.addItem(info("Playing: \(bridgeSourceLabel)"))
+
+        // --- what it is doing, in the words a person uses -------------------
+        menu.addItem(info("\(bridgeDeviceName) — \(rate)"))
+        menu.addItem(info(bridgeSourceNames.isEmpty
+            ? "Nothing playing"
+            : "Following \(bridgeSourceNames)"))
+
+        // Warnings stay at the top: a ⚠ in the status item is a question, and
+        // this is the answer to it.
+        // A fault is announced; restraint is merely reported. Same line, two
+        // registers, because "coreaudiod is not answering" needs you and
+        // "nothing playing has a readable rate" does not.
         if let holding = bridgeHolding {
-            menu.addItem(info("⚠ Holding: \(holding)"))
+            menu.addItem(info("\(bridgeFault == nil ? "" : "⚠ ")\(holding)"))
         }
-        if let elsewhere = bridgeElsewhere {
-            menu.addItem(info("⚠ \(elsewhere)"))
+        if let elsewhere = bridgeElsewhere { menu.addItem(info(elsewhere)) }
+
+        // The one diagnostic that survives to the top level, because it is the
+        // only one the user can act on, and only while it is actionable.
+        if bridgeReaderStatus.hasPrefix("NO ACCESS") {
+            let fix = NSMenuItem(title: "⚠ Allow Ratebridge to read your player…",
+                                 action: #selector(openSetup), keyEquivalent: "")
+            fix.target = self
+            menu.addItem(fix)
         }
-        menu.addItem(info("Reader: \(bridgeReaderStatus)"))
 
         // Idle countdown. Without it, "nothing is happening" and "waiting 108 more
         // seconds before resting" look identical from the menu bar, and the second
@@ -3192,39 +3853,26 @@ final class MenuBarController: NSObject, NSApplicationDelegate {
             let delay = knownPlayerRunning() ? idleRestDelayPlayerOpen : idleRestDelay
             let left = Int(delay - Date().timeIntervalSince(since))
             menu.addItem(info(left > 0
-                ? "Idle: resting to \(formatRate(restingRate)) in \(left)s"
-                : "Idle: at \(formatRate(restingRate))"))
-        }
-
-        if !bridgeLastAction.isEmpty { menu.addItem(info("Last: \(bridgeLastAction)")) }
-
-        if !switchHistory.isEmpty {
-            let historyItem = NSMenuItem(title: "Recent Switches", action: nil, keyEquivalent: "")
-            let historyMenu = NSMenu()
-            for entry in switchHistory { historyMenu.addItem(info(entry)) }
-            historyItem.submenu = historyMenu
-            menu.addItem(historyItem)
+                ? "Resting to \(formatRate(restingRate)) in \(left)s"
+                : "Resting at \(formatRate(restingRate))"))
         }
         menu.addItem(.separator())
 
+        // The master switch, alone in its group. Tried as an On/Off pair to make
+        // the state readable without interpreting a tick; two items for one
+        // boolean turned out to be worse — it reads as a choice to make rather
+        // than a switch that is already set, and it doubled the size of the
+        // group. The menu bar itself now shows the off state plainly enough that
+        // the tick does not have to carry it alone.
         let toggle = NSMenuItem(title: "Enabled", action: #selector(toggleEnabled),
                                 keyEquivalent: "")
         toggle.target = self
         toggle.state = bridgeEnabled ? .on : .off
         menu.addItem(toggle)
-
-        let match = NSMenuItem(title: "Match Now", action: #selector(matchNow), keyEquivalent: "")
-        match.target = self
-        menu.addItem(match)
-
-        let rest = NSMenuItem(title: "Rest to \(formatRate(restingRate))",
-                              action: #selector(restNow), keyEquivalent: "")
-        rest.target = self
-        menu.addItem(rest)
-
         menu.addItem(.separator())
 
-        let deviceItem = NSMenuItem(title: "Target Device", action: nil, keyEquivalent: "")
+
+        let deviceItem = NSMenuItem(title: "Output Device", action: nil, keyEquivalent: "")
         let deviceMenu = NSMenu()
         let pinned = settings.string(forKey: "preferredDevice") ?? ""
         let followItem = NSMenuItem(title: "System Default", action: #selector(pinDevice(_:)),
@@ -3253,22 +3901,211 @@ final class MenuBarController: NSObject, NSApplicationDelegate {
         deviceItem.submenu = deviceMenu
         menu.addItem(deviceItem)
 
-        let login = NSMenuItem(title: "Open at Login", action: #selector(toggleLoginItem),
-                               keyEquivalent: "")
-        login.target = self
-        login.state = SMAppService.mainApp.status == .enabled ? .on : .off
-        menu.addItem(login)
+        // "Open at Login" is a setting, and it was sitting in the menu as though
+        // it were an action. It now lives in Settings > General with the rest of
+        // them.
+        //
+        // "Settings…" and "Setup…" were adjacent, near-homographic, and not even
+        // peers: Setup is a one-time walkthrough, Settings is where you go
+        // afterwards, for ever. Offering both at the same level made the reader
+        // choose between two words that look the same and mean different things.
+        // Only Settings remains here; the walkthrough is reached from a button
+        // inside it, from the ⚠ item above when Accessibility is what is wrong,
+        // and by opening itself on a first run.
 
-        let openLog = NSMenuItem(title: "Reveal Log…", action: #selector(revealLog),
+        // Everything that used to crowd the top level. Still one click away, and
+        // still exactly as detailed — this is a change of placement, not of
+        // content, and `ratebridge probe` remains the real diagnostic.
+        let details = NSMenuItem(title: "Details", action: nil, keyEquivalent: "")
+        let detailsMenu = NSMenu()
+        detailsMenu.addItem(info("Target: \(Device.targetReason)"))
+        detailsMenu.addItem(info("Reader: \(bridgeReaderStatus)"))
+        if !bridgeSourceLabel.isEmpty && bridgeSourceLabel != "nothing" {
+            detailsMenu.addItem(info("Source: \(bridgeSourceLabel)"))
+        }
+        if !bridgeLastAction.isEmpty {
+            detailsMenu.addItem(info("Last: \(bridgeLastAction)"))
+        }
+        if !switchHistory.isEmpty {
+            detailsMenu.addItem(.separator())
+            for entry in switchHistory { detailsMenu.addItem(info(entry)) }
+        }
+        detailsMenu.addItem(.separator())
+
+        // Manual overrides of things that already happen on their own, so they
+        // belong with the diagnostics rather than in front of everyone.
+        //
+        // Match Now is the sharper case: the bridge holds with a ⚠ precisely
+        // when it cannot name a rate it trusts, and this forces the write anyway
+        // — the one thing the whole design exists to avoid. That is a reasonable
+        // escape hatch for someone who knows why they want it and a trap offered
+        // at the top level, where it reads as the button that fixes the ⚠.
+        //
+        // Rest Now only brings the idle timer forward by its remaining seconds.
+        let match = NSMenuItem(title: "Match Now", action: #selector(matchNow),
+                               keyEquivalent: "")
+        match.target = self
+        detailsMenu.addItem(match)
+
+        let rest = NSMenuItem(title: "Rest Now (\(formatRate(restingRate)))",
+                              action: #selector(restNow), keyEquivalent: "")
+        rest.target = self
+        detailsMenu.addItem(rest)
+
+        detailsMenu.addItem(.separator())
+        // No ellipsis: it selects the file in Finder and is done. An ellipsis
+        // says a dialog is coming that will ask you something.
+        let openLog = NSMenuItem(title: "Reveal Log in Finder", action: #selector(revealLog),
                                  keyEquivalent: "")
         openLog.target = self
-        menu.addItem(openLog)
+        detailsMenu.addItem(openLog)
+        details.submenu = detailsMenu
+        menu.addItem(details)
 
         menu.addItem(.separator())
+
+        // Settings sits with Quit rather than with the things it configures.
+        // That is where every other menu bar app keeps it, so it is the pair
+        // people already reach for without reading — and it leaves the group
+        // above as one list of things that act on the bridge itself.
+        let settingsItem = NSMenuItem(title: "Settings…", action: #selector(openSettings),
+                                      keyEquivalent: ",")
+        settingsItem.target = self
+        menu.addItem(settingsItem)
+
         let quit = NSMenuItem(title: "Quit", action: #selector(NSApplication.terminate(_:)),
                               keyEquivalent: "q")
         menu.addItem(quit)
         statusItem.menu = menu
+    }
+
+    /// Two short lines instead of one long one — the shape a sensor readout uses,
+    /// because it is the shape that fits.
+    ///
+    /// `♪ 96 kHz ⚠` was about 68 points of menu bar, which is a lot of somebody
+    /// else's space to hold for a number that changes a few times an hour. The
+    /// same information stacked is roughly 26: the figure on top, its unit
+    /// beneath, both small enough to read as one glyph rather than as text.
+    ///
+    /// The unit line carries the state, so nothing needed a separate symbol: a
+    /// held or misrouted bridge reads `⚠ kHz`, and disabled reads `paused` with
+    /// no figure above it.
+    private func setStatusTitle() {
+        guard let button = statusItem.button else { return }
+        let unit: String
+        let figure: String
+        // Off is muted, but muted from the bar's own colour rather than swapped
+        // for a grey. tertiaryLabelColor was too far — over a wallpaper, with no
+        // background behind the menu bar, it stopped looking switched off and
+        // started looking unlit. Alpha on labelColor keeps the hue the bar is
+        // already using and only takes weight out of it.
+        let colour: NSColor = bridgeEnabled
+            ? .labelColor : NSColor.labelColor.withAlphaComponent(0.55)
+        if !bridgeEnabled {
+            // The device really is at this rate; ratebridge has simply stopped
+            // driving it. Blanking the figure would hide a true reading, so it
+            // is dimmed and struck through instead.
+            unit = "kHz"
+            figure = bridgeCurrentRate > 0 ? rateFigure(bridgeCurrentRate) : "—"
+        } else if bridgeCurrentRate > 0 {
+            // The unit line says kHz once, so the figure is the bare number.
+            // Repeating it would cost the width this whole shape exists to save.
+            unit = "kHz"
+            figure = rateFigure(bridgeCurrentRate)
+        } else {
+            unit = "kHz"
+            figure = "—"
+        }
+
+        // Label above, reading below, the reading larger — the shape a CPU or
+        // network readout uses. The eye lands on the number and takes the label
+        // only once, on the first look, which is the right order for something
+        // glanced at a hundred times a day.
+        let title = NSMutableAttributedString()
+        title.append(NSAttributedString(string: unit + "\n", attributes: [
+            .font: NSFont.systemFont(ofSize: 8, weight: .regular),
+            .paragraphStyle: line(height: 8),
+            .foregroundColor: colour,
+            // The status item centres a title on its baseline, which is right
+            // for the single line it expects and rides high for two — the pair
+            // sits against the top of the bar with all the slack beneath it.
+            // Applied to both runs, or they shear apart.
+            .baselineOffset: statusBaselineDrop,
+        ]))
+        title.append(NSAttributedString(string: figure, attributes: [
+            // Monospaced digits so the item does not change width between 48 and
+            // 96, or twitch every time a 44.1 kHz track follows a 96 kHz one.
+            .font: NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .semibold),
+            .paragraphStyle: line(height: 11),
+            .foregroundColor: colour,
+            .baselineOffset: statusBaselineDrop,
+        ]))
+        button.attributedTitle = title
+
+        // The warning sits beside the pair, not inside one of them. As a
+        // character on the unit line it belonged to "kHz" rather than to the
+        // reading, and it widened only that line — so the two lines no longer
+        // started at the same place, and the item jumped sideways whenever the
+        // condition came and went. A button image is laid out against the whole
+        // title block and centred on it, which is what it is describing.
+        if !bridgeEnabled {
+            // No icon for this one. The slash already crosses both lines, and a
+            // symbol beside them would add width to say a second time what the
+            // struck-out reading has said — the warning earns its icon because
+            // there is nothing else on screen carrying that meaning.
+            button.image = nil
+            button.imagePosition = .noImage
+            // Sized to the rendered title, not the button: the button carries
+            // the menu bar's own padding either side, and a line spanning that
+            // ran well clear of the text at both ends.
+            let text = title.size()
+            let width = ceil(text.width)
+            slash.frame = NSRect(x: ((button.bounds.width - width) / 2).rounded(),
+                                 y: 4, width: width, height: button.bounds.height - 8)
+            slash.stroke = colour
+            if slash.superview == nil { button.addSubview(slash) }
+            slash.isHidden = false
+            slash.needsDisplay = true
+        } else if bridgeFault != nil {
+            slash.isHidden = true
+            let config = NSImage.SymbolConfiguration(pointSize: 10, weight: .semibold)
+            button.image = NSImage(systemSymbolName: "exclamationmark.triangle.fill",
+                                   accessibilityDescription: "not switching")?
+                .withSymbolConfiguration(config)
+            button.imagePosition = .imageLeading
+            button.imageHugsTitle = true
+        } else {
+            slash.isHidden = true
+            button.image = nil
+            button.imagePosition = .noImage
+        }
+    }
+
+    /// The bare number: "44.1", "96". The unit line says kHz once, so repeating
+    /// it on the figure would cost the width this shape exists to save.
+    private func rateFigure(_ rate: Float64) -> String {
+        let khz = rate / 1000
+        return khz.truncatingRemainder(dividingBy: 1) == 0
+            ? "\(Int(khz))" : String(format: "%.1f", khz)
+    }
+
+    /// How far the two-line title is pushed down to sit level in the bar.
+    private var statusBaselineDrop: CGFloat { -3.0 }
+
+    /// A centred line box of a fixed height.
+    ///
+    /// Pinned rather than left to the font's own leading: the menu bar is 22
+    /// points tall and has to hold two lines, which is less room than either
+    /// font would take by default.
+    private func line(height: CGFloat) -> NSParagraphStyle {
+        let paragraph = NSMutableParagraphStyle()
+        // Left, not centred. The unit is always wider than the figure, so
+        // centring hung the number in the middle of the label and the pair
+        // wandered sideways whenever 44.1 followed 96.
+        paragraph.alignment = .left
+        paragraph.maximumLineHeight = height
+        paragraph.minimumLineHeight = height
+        return paragraph
     }
 
     private func info(_ text: String) -> NSMenuItem {
@@ -3276,6 +4113,10 @@ final class MenuBarController: NSObject, NSApplicationDelegate {
         item.isEnabled = false
         return item
     }
+
+    @objc private func openSetup() { SetupWindowController.shared.show() }
+
+    @objc private func openSettings() { SettingsWindowController.shared.show() }
 
     @objc private func toggleEnabled() { bridgeEnabled.toggle(); rebuild() }
 
@@ -3390,6 +4231,7 @@ func commandProbe(_ device: Device) -> Never {
     print("device        \(device.name) @ \(formatRate(device.nominalRate))"
         + "   [\(Device.targetReason)]")
     if let mismatch = targetIsNotSystemOutput(device) { print("⚠ output       \(mismatch)") }
+    if let mute = switchMuteStatus(device) { print("switch mute   \(mute)") }
     print("")
 
     print("output devices:")
@@ -3414,10 +4256,20 @@ func commandProbe(_ device: Device) -> Never {
 
     print("active output processes (\(active.count)):")
     if active.isEmpty { print("  (none)") }
+    let outputNames = Device.namesByID()
     for process in active {
-        let onTarget = process.uses(device) ? "on target device"
-            : isDeclaredRouted(process) ? "routed to target (declared)"
-            : "on another device"
+        // Always says where it renders, even when something else decides the
+        // verdict. That is the fact the verdict is derived from, and a diagnosis
+        // that hides its input makes you take its word for it.
+        let renders = process.deviceIDs.compactMap { outputNames[$0] }.first ?? "unknown device"
+        let onTarget: String
+        switch process.verdict(for: device) {
+        case .onTarget:  onTarget = "on target device"
+        case .declared:  onTarget = "counted (declared) — renders on \(renders)"
+        case .assumed:   onTarget = "counted (assumed) — renders on \(renders)"
+        case .excluded:  onTarget = "not counted (excluded) — renders on \(renders)"
+        case .elsewhere: onTarget = "not counted — renders on \(renders)"
+        }
         let state: String
         switch PlayerState.of(process.bundleID) {
         case .playing: state = "playing"
@@ -3563,6 +4415,9 @@ func commandConfig(_ args: [String]) -> Never {
         ("conflict", { conflictPolicy.rawValue }),
         ("manual-override", { manualOverrideGrace > 0
             ? "\(Int(manualOverrideGrace))s" : "off" }),
+        ("mute-during-switch", { switchMuteGrace > 0
+            ? String(format: "%.2fs", switchMuteGrace) : "off" }),
+        ("mute-over-others", { muteOverOthers ? "on" : "off" }),
     ]
 
     guard args.count >= 2 else {
@@ -3578,16 +4433,30 @@ func commandConfig(_ args: [String]) -> Never {
         print("                                             hold      leave the device alone")
         print("  ratebridge config manual-override 300    seconds to yield after someone else")
         print("                                           sets the rate (FineTune, `ratebridge set`)")
+        print("  ratebridge config mute-during-switch on  silence the system output while")
+        print("                                           the device relocks, so a redirected")
+        print("                                           app cannot leak out of the system")
+        print("                                           output while it relocks")
+        print("                                           (on|off|seconds; only applies when")
+        print("                                           the target is not the system output)")
+        print("  ratebridge config mute-over-others off   stop muting whenever another app")
+        print("                                           is playing on the system output —")
+        print("                                           on by default, and turning it off")
+        print("                                           means the leak gets out instead")
         print("  ratebridge config reset                  back to defaults")
+        print("  ratebridge config reset all              …and clear every per-app rule,")
+        print("                                           exclusion and routing declaration")
+        print("                                           (your pinned device is kept)")
         exit(Exit.ok.rawValue)
     }
 
     if args[1] == "reset" {
-        for key in ["idleRate", "idleRestDelay", "idleRestDelayPlayerOpen", "autoDetectDAC",
-                    "conflict", "manualOverrideGrace", "priority"] {
-            settings.removeObject(forKey: key)
-        }
-        print("settings reset to defaults")
+        let everything = args.count > 2 && args[2] == "all"
+        resetSettings(includingApps: everything)
+        print(everything
+            ? "settings, per-app rules, exclusions and routing declarations reset to defaults"
+            : "settings reset to defaults  (`ratebridge config reset all` also clears "
+              + "per-app rules and exclusions)")
         exit(Exit.ok.rawValue)
     }
 
@@ -3639,6 +4508,42 @@ func commandConfig(_ args: [String]) -> Never {
               + "everything below it is resampled"
             : "conflict policy is now `hold` — with more than one source live, "
               + "the device is left alone")
+    case "mute-over-others":
+        guard value == "on" || value == "off" else {
+            die(.unsupportedRate, "mute-over-others needs on or off")
+        }
+        settings.set(value == "on", forKey: "muteDuringSwitchOverOthers")
+        print(value == "on"
+            ? "the system output will be muted across a rate change even while another app "
+              + "is playing on it — that app goes quiet for the relock too"
+            : "the system output will be left alone whenever another app is playing on it")
+        if switchMuteGrace <= 0 {
+            print("note: `mute-during-switch` is off, so nothing is muted at all")
+        }
+        exit(Exit.ok.rawValue)
+    case "mute-during-switch":
+        let seconds: Double
+        switch value {
+        case "on":  seconds = 0.35
+        case "off": seconds = 0
+        default:
+            guard let parsed = Double(value), parsed >= 0, parsed <= 2 else {
+                die(.unsupportedRate, "mute-during-switch needs on, off, or seconds up to 2")
+            }
+            seconds = parsed
+        }
+        settings.set(seconds, forKey: "muteDuringSwitch")
+        if seconds > 0 {
+            print(String(format: "the system output will be muted for %.2fs across a rate "
+                               + "change", seconds))
+            if let target = (withAudioDeadline(3) { Device.target() }) ?? nil,
+               let system = Device.defaultOutput(), system.id == target.id {
+                print("note: \(target.name) is the system output, so nothing can leak and "
+                    + "this will not engage")
+            }
+        } else {
+            print("the system output will be left alone across a rate change")
+        }
     case "manual-override":
         guard let seconds = Double(value), seconds >= 0 else {
             die(.unsupportedRate, "manual-override needs seconds, or 0 to disable")
@@ -3717,21 +4622,25 @@ func commandRule(_ args: [String]) -> Never {
         print("")
         print("  any app not listed: its open audio files are read when they agree")
         print("")
-        print("  ratebridge rule <bundle-id> ui           read the rate off its own window")
-        print("  ratebridge rule <bundle-id> ui:Name      the same, naming its process")
-        print("  ratebridge rule <bundle-id> file         read its open audio file")
-        print("  ratebridge rule <bundle-id> file:44100   read the file, else assume 44100")
-        print("  ratebridge rule <bundle-id> 48000        always this rate")
-        print("  ratebridge rule <bundle-id> script       ask it over Apple Events")
-        print("  ratebridge rule <bundle-id> off          invisible to the bridge entirely")
-        print("  ratebridge rule <bundle-id> default      drop the override")
+        print("  <id> is a bundle id, or the executable name for a process without")
+        print("  one — `afplay`, a helper, a game's audio process. `probe` prints both.")
+        print("")
+        print("  ratebridge rule <id> ui          read the rate off its own window")
+        print("  ratebridge rule <id> ui:Name     the same, naming its process")
+        print("  ratebridge rule <id> file        read its open audio file")
+        print("  ratebridge rule <id> file:44100  read the file, else assume 44100")
+        print("  ratebridge rule <id> 48000       always this rate")
+        print("  ratebridge rule <id> script      ask it over Apple Events")
+        print("  ratebridge rule <id> off         invisible to the bridge entirely")
+        print("  ratebridge rule <id> default     drop the override")
         exit(Exit.ok.rawValue)
     }
 
     let bundleID = args[1]
     guard args.count >= 3 else {
         die(.unsupportedRate,
-            "usage: ratebridge rule <bundle-id> <ui|ui:Process|script|file|file:HZ|HZ|off|default>")
+            "usage: ratebridge rule <bundle-id|process-name> "
+            + "<ui|ui:Process|script|file|file:HZ|HZ|off|default>")
     }
 
     var updated = overrides
@@ -3826,9 +4735,12 @@ func commandRouted(_ args: [String]) -> Never {
         print("  its sound does NOT come out of my target:  ratebridge rule <id> off")
         print("  its sound DOES come out of my target:      ratebridge routed add <id>")
         print("")
-        print("Without the second one, an app routed to your DAC is invisible: the")
-        print("bridge sees nothing on the device, rests at the idle rate, and the DAC")
-        print("resamples the track it is actually playing.")
+        print("The second one is rarely needed now. When the target is not the system")
+        print("output, nothing about routing is measurable, so every playing app is")
+        print("assumed to reach the target and `rule <id> off` marks the ones that do")
+        print("not. This list stays as an explicit override — it wins over the")
+        print("assumption, and it still means something if you later pin the target to")
+        print("the system output, where the assumption does not apply.")
         print("")
         print("  ratebridge routed add <bundle-id|process-name>")
         print("  ratebridge routed remove <bundle-id|process-name>")
@@ -3859,6 +4771,29 @@ func commandRouted(_ args: [String]) -> Never {
         die(.unsupportedRate, "usage: ratebridge routed add|remove <bundle-id|process-name>")
     }
     exit(Exit.ok.rawValue)
+}
+
+/// Everything a person can change, in one place.
+///
+/// Written as a function rather than as a list inside the `config` command
+/// because the Settings window offers the same thing, and two copies of "which
+/// keys count as a setting" would have drifted the first time one gained a key —
+/// as `muteDuringSwitchOverOthers` did the day it was added.
+///
+/// `preferredDevice` is deliberately not here, and neither is the login item.
+/// Both are setup rather than tweaking: someone who has tangled their rates does
+/// not also want their DAC unpinned and their Mac to stop starting the app,
+/// and both cost real effort to redo.
+func resetSettings(includingApps: Bool) {
+    for key in ["idleRate", "idleRestDelay", "idleRestDelayPlayerOpen", "autoDetectDAC",
+                "conflict", "manualOverrideGrace", "priority", "muteDuringSwitch",
+                "muteDuringSwitchOverOthers"] {
+        settings.removeObject(forKey: key)
+    }
+    guard includingApps else { return }
+    for key in ["rules", "routedProcesses", "ignoredProcesses"] {
+        settings.removeObject(forKey: key)
+    }
 }
 
 func commandIgnore(_ args: [String]) -> Never {

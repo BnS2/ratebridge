@@ -3,12 +3,19 @@
 Makes your DAC's sample rate follow whatever is actually playing.
 
 ```
-♪ 96 kHz
+ kHz                 ← the menu bar item: unit above, rate below
+  96
 ────────────────────────────────
-M2s — 96 kHz   [pinned]
-Playing: com.wangchujiang.musicer
-Reader: reading Musicer
-Last: 44100 → 96000 Hz
+M2s — 96 kHz
+Following Musicer
+Resting to 48 kHz in 108s
+────────────────────────────────
+✓ Enabled
+────────────────────────────────
+Output Device                  ▸
+Settings…
+Details                        ▸
+Quit
 ```
 
 ## The problem
@@ -34,6 +41,11 @@ command, not a code change.
 **It never guesses.** Every tier either states a rate or says nothing. A source
 it cannot read is skipped, not obeyed — because a wrong rate written into a live
 stream is worse than no write at all.
+
+**There is a window when you want one.** Settings shows which app is setting the
+rate right now, which ones are excluded from your device, and where it parks when
+nothing plays. It is not a second source of truth: the window and the CLI read
+and write the same store, so neither can drift from the other.
 
 **It says why.** Every switch is logged with its reason and its evidence:
 
@@ -63,8 +75,10 @@ The installer checks the OS version, builds, bundles and launches. Three steps
 it cannot do for you, and it prints them:
 
 1. **Accessibility** — System Settings → Privacy & Security → Accessibility, add
-   `/Applications/Ratebridge.app`. Only needed for players that publish no
-   scripting interface and must be read from their own window.
+   `/Applications/Ratebridge.app`. Wanted by any player that keeps several
+   tracks open at once — reading what it shows on screen is what says which of
+   them you are hearing — and required by players that publish no scripting
+   interface and must be read from their own window.
 2. **Pin your DAC** — `ratebridge device "Your DAC"`. Skip it if exactly one USB
    DAC is attached; it is found automatically.
 3. **Open at Login** — tick it in the menu bar menu.
@@ -119,7 +133,8 @@ queued, sometimes the last few — often at different rates. So:
 - if every open file agrees, that is the answer;
 - if they disagree, the player is asked which one, by matching its **on-screen
   title** against the filenames, then its **on-screen duration** against the
-  container length;
+  container length — an Accessibility read, and the reason step 1 of the install
+  is worth doing whichever player you use;
 - if neither identifies exactly one file, it returns nothing.
 
 The player is read from its windows *and its status bar item*, so a player
@@ -145,23 +160,33 @@ carries its audio elsewhere. That tap is **private**: the system tap list reads
 empty while a redirect is running, and `kAudioProcessPropertyDevices` goes on
 reporting where the app *renders*.
 
-So a redirect can only be declared, and it has two directions:
+What follows from that depends on one thing — whether your target device is also
+the system output.
 
-| What is happening | What CoreAudio says | Tell it |
-|---|---|---|
-| App renders to your DAC, router sends it to the speakers | it is on your DAC | `ratebridge rule <id> off` |
-| App renders to the speakers, router sends it to your DAC | it is on the speakers | `ratebridge routed add <id>` |
+**When it is** (no router, DAC selected in Sound settings), CoreAudio's report is
+the answer. An app it puts on another device is on another device, and nothing
+needs declaring.
 
-Without the second, an app your router pins to the DAC is invisible: the bridge
-sees nothing on the device, rests at the idle rate, and the DAC resamples every
-track. `status` and `probe` mark each playing app `[elsewhere]` or
-`[routed here]` so you can see which side you are on.
+**When it is not**, nothing about routing is measurable. A redirected app reports
+the system output because that is where it renders; an app that is *not*
+redirected reports the same thing. The two are indistinguishable, so ratebridge
+assumes anything playing reaches your device and you mark the exceptions:
 
-Neither declaration names a particular utility. What is described is a state —
-*this app's sound does or does not come out of my target device* — not whose
-software put it there. None of this is required: with no router installed and
-the system output on your DAC, apps land there natively and nothing needs
-declaring.
+| What is happening | Tell it |
+|---|---|
+| This app's sound comes out somewhere else — a browser, a chat app | `ratebridge rule <id> off` (Settings: **Excluded**) |
+| This app reaches my device and I want it ignored anyway | the same mark; one effect, one control |
+
+`status` marks each playing app `[not on <device>]` when it is excluded, and
+`probe` says whether being counted was measured, declared or assumed.
+
+`ratebridge routed add <id>` still exists as an explicit override — it wins over
+the assumption — but it is rarely needed now. It matters mainly if you later pin
+the target to the system output, where the assumption does not apply.
+
+Nothing here names a particular utility. What is described is a state — *this
+app's sound does or does not come out of my target device* — not whose software
+put it there.
 
 ## What it will not do
 

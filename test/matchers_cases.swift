@@ -47,6 +47,47 @@ fixture = ["/m/Panis ka boy - GA Chillerong Ghetto, Paul N Ballin.flac": 999.0,
 check("name beats duration when both could fire",
       identifyPlayingFile(files, showing: ["Panis ka boy", "2:58"]), files[0])
 
+// The invariant that made the wiring bug possible, pinned so it stays visible:
+// with nothing on screen there is no answer, by construction. Every tier but the
+// `ui` one used to reach openFileRate with exactly this — an empty list — so a
+// gapless player that was not Musicer could never be identified at all. The fix
+// is that openFileRate now primes the reader itself; this case is why it has to.
+check("nothing on screen identifies nothing",
+      identifyPlayingFile(files, showing: []), nil)
+
 print("")
+
+// The precedence that decides whether a process counts for the managed device.
+// Every one of these was a real state on this Mac tonight, and two of them were
+// wrong at some point in the evening: `routed` ahead of `off` left an excluded
+// app counted, and an early draft assumed without asking where the process
+// actually renders.
+func verdictName(_ usesTarget: Bool, _ ruledOff: Bool, _ declared: Bool,
+                 _ targetIsSystemOutput: Bool, _ rendersOnSystemOutput: Bool) -> String {
+    reachVerdict(usesTarget: usesTarget, ruledOff: ruledOff, declared: declared,
+                 targetIsSystemOutput: targetIsSystemOutput,
+                 rendersOnSystemOutput: rendersOnSystemOutput).rawValue
+}
+
+check("measurement wins over everything",
+      verdictName(true, true, true, false, true), "onTarget")
+check("exclusion beats a routing declaration",
+      verdictName(false, true, true, false, true), "excluded")
+check("exclusion beats the assumption",
+      verdictName(false, true, false, false, true), "excluded")
+check("a declaration beats the assumption's limits",
+      verdictName(false, false, true, true, false), "declared")
+check("no guessing when the target is the system output",
+      verdictName(false, false, false, true, true), "elsewhere")
+check("assumed only for apps on the system output",
+      verdictName(false, false, false, false, true), "assumed")
+check("a third device is measurably elsewhere",
+      verdictName(false, false, false, false, false), "elsewhere")
+check("counting follows the verdict",
+      [true, false, true, true, false]
+        .map { $0 ? "y" : "n" }.joined(),
+      [ReachVerdict.onTarget, .excluded, .declared, .assumed, .elsewhere]
+        .map { $0.counts ? "y" : "n" }.joined())
+
 print("pass \(pass)   fail \(fail)")
 exit(fail == 0 ? 0 : 1)

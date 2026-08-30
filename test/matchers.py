@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""Build a Swift harness around the file-identification matchers.
+"""Build a Swift harness around the pure decisions in the bridge.
+
+Two of them: which of several open files a rate is read from, and whether a
+process counts for the managed device at all.
 
 The matchers are the sharpest edge in the tool: they decide which of several
 open files a rate is read from, and a wrong answer writes a wrong rate into a
@@ -26,8 +29,23 @@ def grab(name):
         k += 1
     return src[i:k + 1]
 
+def grab_from(marker):
+    """Same brace-matching, for a declaration that is not a func."""
+    i = src.index(marker)
+    depth, k = 0, src.index("{", i)
+    while True:
+        if src[k] == "{":
+            depth += 1
+        elif src[k] == "}":
+            depth -= 1
+            if depth == 0:
+                break
+        k += 1
+    return src[i:k + 1]
+
 parts = ["import Foundation", ""]
-for name in ["squashed(", "parseClock(", "fileMatchingOnScreenText(",
+parts.append(grab_from("enum ReachVerdict"))
+for name in ["reachVerdict(", "squashed(", "parseClock(", "fileMatchingOnScreenText(",
              "fileMatchingDuration(", "identifyPlayingFile("]:
     parts.append(grab(name))
 

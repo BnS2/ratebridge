@@ -74,12 +74,18 @@ echo
 cat <<'NEXT'
 Three steps left, none of which can be scripted:
 
-  1. Accessibility  (only needed if you use Musicer)
+  1. Accessibility  (recommended for any music player)
      System Settings > Privacy & Security > Accessibility
      Remove any old Ratebridge entry, then add /Applications/Ratebridge.app.
      Removing first matters: macOS will not rebind a stale entry to a new
-     signature. Musicer publishes no scripting interface, so reading its window
-     is the only way to know its rate.
+     signature.
+
+     What it buys you, for every player and not just a named one: a gapless
+     player keeps several tracks open at once, often at different rates, and
+     reading what the player is showing on screen is what says which of them you
+     are actually hearing. Without it a player like that is skipped rather than
+     guessed at, and the DAC stays where it was. It is also the only way to read
+     a rate from a player that publishes no scripting interface.
 
   2. Pin your DAC
      ratebridge device                 # list what is connected

@@ -96,16 +96,42 @@ if [ "${1:-}" = "--no-audio" ]; then
           "$RB" routed remove com.example.routed
     check "routed rejects nonsense"     "usage"              "$RB" routed nonsense x
 
-    # The file-identification matchers, lifted out of Sources/main.swift and run
-    # against fixtures. They decide which of several open files a rate is read
-    # from, so a wrong answer here writes a wrong rate into a live stream — and
-    # they are pure functions, so none of that needs a DAC to catch.
+    # The wiring the matchers cannot see. `identifyPlayingFile` is pure and was
+    # always correct; the bug was that only the `ui` branch ever handed it
+    # anything to match, so every other tier asked it to identify a track from an
+    # empty list and got nil for ever. A pure-function test passes either way, so
+    # assert the structure instead: openFileRate must prime the reader itself
+    # when its caller had nothing, or the whole file tier is Musicer-only again.
+    if awk '/^func openFileRate/,/^}/' Sources/main.swift \
+       | grep -q 'PlayerUIReader.readNative(pid: pid)'; then
+        P=$((P+1)); echo "  PASS  file tier primes the reader for any player"
+    else
+        F=$((F+1)); echo "  FAIL  file tier primes the reader for any player"
+    fi
+
+    # The same class of regression one level up: a player the user added a rule
+    # for must count as a session player, or pausing it rests the DAC on the
+    # short 30s delay instead of the 120s one meant for an open player.
+    if awk '/^var sessionPlayerBundleIDs/,/^}/' Sources/main.swift \
+       | grep -q 'settings.dictionary(forKey: "rules")'; then
+        P=$((P+1)); echo "  PASS  user-added players count as session players"
+    else
+        F=$((F+1)); echo "  FAIL  user-added players count as session players"
+    fi
+
+    # The pure decisions, lifted out of Sources/main.swift and run against
+    # fixtures: which of several open files a rate is read from, and whether a
+    # process counts for the managed device at all. A wrong answer in the first
+    # writes a wrong rate into a live stream; a wrong answer in the second
+    # decides whose rate is written, and whether the speakers are muted over it.
+    # Neither needs a DAC to catch, and both are lifted rather than copied —
+    # a copy that drifts is a test that lies.
     GEN="$(mktemp -t ratebridge-matchers).swift"
     if python3 test/matchers.py "$GEN" 2>/dev/null \
        && swiftc -O "$GEN" -o "${GEN%.swift}" 2>/dev/null; then
         echo
         if "${GEN%.swift}"; then
-            P=$((P+13))
+            P=$((P+22))
         else
             F=$((F+1)); echo "  FAIL  matcher suite"
         fi
@@ -171,7 +197,12 @@ echo
 # This cost two runs: once a browser at a fixed 48 kHz, once a music player
 # outranking an unruled `afplay`. Both times the bridge was correct and the
 # scoreboard said otherwise.
-busy=$("$RB" status | sed -n 's/^playing *//p')
+# Only what actually counts. `status` now lists excluded apps too, marked, so a
+# literal read of this line refuses to test a Mac where the only thing playing is
+# something the user deliberately took out of the picture.
+busy=$("$RB" status | sed -n 's/^playing *//p' \
+    | tr ',' '\n' | grep -v '\[excluded\]' | grep -v '\[not on ' | tr '\n' ',' \
+    | sed 's/^,*//; s/,*$//')
 if [ -n "$busy" ] && [ "$busy" != "nothing" ]; then
     echo "  cannot test — something is already playing on the target:"
     echo "      $busy"
@@ -181,13 +212,23 @@ if [ -n "$busy" ] && [ "$busy" != "nothing" ]; then
     exit 1
 fi
 
+# A mismatch used to be fatal here, and under the old model it was: a tone
+# playing to the system output could never count for a device pinned elsewhere,
+# so every rate scored FAIL for a bridge that was working. That stopped being
+# true on 2026-08-30. Anything playing on the system output is now assumed to
+# reach the target unless excluded, which is precisely how a redirected app
+# behaves — verified with this same `afplay`, which took the DAC to 192 kHz and
+# back to 44.1 while rendering on the built-in speakers. So it is a note now, not
+# a refusal: the tones will not be audible *on* the target, and the switch mute
+# will silence the system output across each write, but the rate the bridge
+# chooses is exactly what this suite measures.
 mismatch=$("$RB" status | sed -n 's/^⚠ output *//p')
 if [ -n "$mismatch" ]; then
-    echo "  cannot test — $mismatch"
+    echo "  note — $mismatch"
     echo
-    echo "  Either switch the system output to \"${device%% \[*}\", or pin the bridge to"
-    echo "  where the sound is going:  $RB device default"
-    exit 1
+    echo "  Testing anyway: the tones count for the target the same way a redirected"
+    echo "  app does. They will be audible on the system output, not on the target."
+    echo
 fi
 
 for rate in $RATES; do
