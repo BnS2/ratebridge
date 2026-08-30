@@ -60,22 +60,13 @@ and write the same store, so neither can drift from the other.
 ## Requirements
 
 - macOS 14.2 or newer (it needs `kAudioHardwarePropertyProcessObjectList`)
-- Xcode command line tools, for `swiftc` — building only, not for the download
+- Xcode command line tools, for `swiftc`
 - A DAC worth doing this for
 
 ## Install
 
-Either way you end up with `/Applications/Ratebridge.app`. Only the source route
-installs the `ratebridge` command alongside it.
-
-**Download** — [the latest release](https://github.com/BnS2/ratebridge/releases/latest),
-unzip, drag to /Applications. The build is arm64; on Intel, build from source.
-It is signed with a development certificate rather than notarised, so the first
-launch is right-click → **Open** → Open. A double-click is refused until you have
-done that once, which is macOS being right: nobody has vouched for this binary
-but its author.
-
-**Build** — also the upgrade path, and safe to re-run:
+**Build it.** This is the route that just works, and it is the upgrade path —
+safe to re-run.
 
 ```bash
 git clone https://github.com/BnS2/ratebridge.git
@@ -83,8 +74,21 @@ cd ratebridge
 ./install.sh
 ```
 
-The installer checks the OS version, builds, bundles and launches. Three steps
-it cannot do for you, and it prints them:
+The installer checks the OS version, builds, bundles, signs with whatever
+certificate your Mac already has, and launches. What you build yourself is never
+quarantined, so it opens on a double-click, and this route installs the
+`ratebridge` command alongside the app.
+
+**Or download** [the latest release](https://github.com/BnS2/ratebridge/releases/latest)
+— the same thing, built for arm64, for a Mac without the command line tools.
+Expect macOS to refuse it the first time: it is signed with a development
+certificate and is not notarised, so Gatekeeper has nothing to check it against.
+Open **System Settings → Privacy & Security**, find the notice about Ratebridge
+being blocked, and choose **Open Anyway**. Getting rid of that step means
+notarising, which means an Apple Developer Program membership; this project would
+rather you built it from source.
+
+The installer prints three steps it cannot do for you:
 
 1. **Accessibility** — System Settings → Privacy & Security → Accessibility, add
    `/Applications/Ratebridge.app`. Wanted by any player that keeps several
