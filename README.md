@@ -60,13 +60,25 @@ and write the same store, so neither can drift from the other.
 ## Requirements
 
 - macOS 14.2 or newer (it needs `kAudioHardwarePropertyProcessObjectList`)
-- Xcode command line tools, for `swiftc`
+- Xcode command line tools, for `swiftc` — building only, not for the download
 - A DAC worth doing this for
 
 ## Install
 
+Either way you end up with `/Applications/Ratebridge.app`. Only the source route
+installs the `ratebridge` command alongside it.
+
+**Download** — [the latest release](https://github.com/BnS2/ratebridge/releases/latest),
+unzip, drag to /Applications. The build is arm64; on Intel, build from source.
+It is signed with a development certificate rather than notarised, so the first
+launch is right-click → **Open** → Open. A double-click is refused until you have
+done that once, which is macOS being right: nobody has vouched for this binary
+but its author.
+
+**Build** — also the upgrade path, and safe to re-run:
+
 ```bash
-git clone https://github.com/<you>/ratebridge.git
+git clone https://github.com/BnS2/ratebridge.git
 cd ratebridge
 ./install.sh
 ```
